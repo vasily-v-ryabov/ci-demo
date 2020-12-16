@@ -490,13 +490,18 @@ def runDocker(image, config, branchName=null, axis=null, Closure func, runInDock
         unstash "${env.JOB_NAME}"
         onUnstash()
         stage(branchName) {
-            if (runInDocker) {
-                def opts = getDockerOpt(config)
-                docker.image(image.url).inside(opts) {
+            withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: "${config.registry_auth}",
+            usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]) {
+                sh "docker login -u ${USERNAME} -p ${PASSWORD} https://${config.registry_host}"
+                if (runInDocker) {
+                    def opts = getDockerOpt(config)
+                    docker.image(image.url).inside(opts) {
+                        func(image, config)
+                    }
+                } else {
                     func(image, config)
                 }
-            } else {
-                func(image, config)
+                sh "docker logout https://${config.registry_host}"
             }
         }
     }
@@ -638,7 +643,9 @@ def buildDocker(image, config) {
         config.logger.info("Going to fetch docker image: ${img} from ${config.registry_host}")
         def need_build = 0
 
-        docker.withRegistry("https://${config.registry_host}", config.registry_auth) {
+        withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: "${config.registry_auth}",
+        usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]) {
+            sh "docker login -u ${USERNAME} -p ${PASSWORD} https://${config.registry_host}"
             try {
                 config.logger.info("Pulling image - ${img}")
                 docker.image(img).pull()
@@ -658,9 +665,13 @@ def buildDocker(image, config) {
                 need_build++
             }
             if (need_build) {
+                if (image.prepare) {
+                    run_shell(image.prepare, "Preparing Docker build context for ${filename}")
+                }
                 config.logger.info("Building - ${img} - ${filename}")
                 buildImage(img, filename, extra_args, config)
             }
+            sh "docker logout https://${config.registry_host}"
         }
     }
 }
@@ -801,8 +812,9 @@ def main() {
 
             def arch_distro_map = gen_image_map(config)
             arch_distro_map.each { arch, images ->
-                images.each { image ->
-                    parallelBuildDockers[image.name] = {
+                images.eachWithIndex { image, index ->
+                    // make every docker image name unique by index
+                    parallelBuildDockers[image.name + "/" + arch + "/" + index] = {
                         if (image.nodeLabel) {
                             runDocker(image, config, "Preparing docker image", null, { pimage, pconfig -> buildDocker(pimage, pconfig) }, false)
                         } else {
@@ -812,7 +824,7 @@ def main() {
                     branches += getMatrixTasks(image, config)
                 }
             }
-        
+
             try {
                 def bSize = getConfigVal(config, ['batchSize'], 0)
                 def timeout_min = getConfigVal(config, ['timeout_minutes'], "90")
@@ -825,11 +837,76 @@ def main() {
             } finally {
                 if (config.pipeline_stop) {
                     def cmd = config.pipeline_stop.run
+                    def name = "Stop ${config.job}"
+                    if (config.pipeline_stop.name) {
+                        name = config.pipeline_stop.name
+                    }
+                    def run_image = 'docker:19.03'
+                    if (config.pipeline_stop.image) {
+                        run_image = config.pipeline_stop.image
+                    }
                     if (cmd) {
-                        logger.debug("running pipeline_stop")
-                        stage("Stop ${config.job}") {
-                            run_shell("${cmd}", "stop")
+
+                        if (!config.pipeline_stop.arch) {
+                            config.pipeline_stop.arch = 'x86_64'
                         }
+
+                        def myVols = config.volumes.collect()
+                        myVols.add([mountPath: '/var/run/docker.sock', hostPath: '/var/run/docker.sock'])
+                        def listV = parseListV(myVols)
+                        def cloudName = getConfigVal(config, ['kubernetes','cloud'], "")
+
+                        def k8sArchConf = getArchConf(config, config.pipeline_stop.arch)
+                        def nodeSelector = ''
+                        if (!k8sArchConf) {
+                            config.logger.error("pipeline_stop | arch conf is not defined for ${config.pipeline_stop.arch}")
+                            return
+                        }
+                        nodeSelector = k8sArchConf.nodeSelector
+                        if (config.pipeline_stop.nodeSelector) {
+                            if (nodeSelector) {
+                                nodeSelector = nodeSelector + ',' + config.pipeline_stop.nodeSelector
+                            } else {
+                                nodeSelector = config.pipeline_stop.nodeSelector
+                            }
+                        }
+
+                        config.logger.info("Running pipeline_stop on docker image ${run_image} | nodeSelector: ${nodeSelector}")
+
+                        podTemplate(
+                            cloud: cloudName,
+                            runAsUser: "0",
+                            runAsGroup: "0",
+                            nodeSelector: nodeSelector,
+                            containers: [
+                                containerTemplate(name: 'jnlp', image: k8sArchConf.jnlpImage, args: '${computer.jnlpmac} ${computer.name}'),
+                                containerTemplate(name: 'docker', image: run_image, ttyEnabled: true, alwaysPullImage: true, command: 'cat')
+                            ],
+                            volumes: listV
+                        )
+                        {
+                            node(POD_LABEL) {
+                                unstash "${env.JOB_NAME}"
+                                onUnstash()
+
+                                container('docker') {
+                                    stage(name) {
+                                        withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: "${config.registry_auth}",
+                                        usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]) {
+                                            sh "docker login -u ${USERNAME} -p ${PASSWORD} https://${config.registry_host}"
+                                            run_shell("${cmd}", "stop")
+                                            sh "docker logout https://${config.registry_host}"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        //stage("Stop ${config.job}") {
+                        //    docker.withRegistry("https://${config.registry_host}", config.registry_auth) {
+                        //        run_shell("${cmd}", "stop")
+                        //    }
+                        //}
                     }
                 }
             }
