@@ -658,6 +658,9 @@ def buildDocker(image, config) {
                 need_build++
             }
             if (need_build) {
+                if (image.prepare) {
+                    run_shell(image.prepare, "Preparing Docker build context for ${filename}")
+                }
                 config.logger.info("Building - ${img} - ${filename}")
                 buildImage(img, filename, extra_args, config)
             }
@@ -801,8 +804,9 @@ def main() {
 
             def arch_distro_map = gen_image_map(config)
             arch_distro_map.each { arch, images ->
-                images.each { image ->
-                    parallelBuildDockers[image.name] = {
+                images.eachWithIndex { image, index ->
+                    // make every docker image name unique by index
+                    parallelBuildDockers[image.name + "/" + arch + "/" + index] = {
                         if (image.nodeLabel) {
                             runDocker(image, config, "Preparing docker image", null, { pimage, pconfig -> buildDocker(pimage, pconfig) }, false)
                         } else {
@@ -812,7 +816,7 @@ def main() {
                     branches += getMatrixTasks(image, config)
                 }
             }
-        
+
             try {
                 def bSize = getConfigVal(config, ['batchSize'], 0)
                 def timeout_min = getConfigVal(config, ['timeout_minutes'], "90")
@@ -826,7 +830,7 @@ def main() {
                 if (config.pipeline_stop) {
                     def cmd = config.pipeline_stop.run
                     if (cmd) {
-                        logger.debug("running pipeline_stop")
+                        logger.debug("Running pipeline_stop")
                         stage("Stop ${config.job}") {
                             run_shell("${cmd}", "stop")
                         }
