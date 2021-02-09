@@ -509,7 +509,7 @@ def parseListV(volumes) {
     return listV
 }
 
-def runK8(image, branchName, config, axis) {
+def runK8(image, branchName, config, axis, Closure func) {
 
     def cloudName = image.cloud ?: getConfigVal(config, ['kubernetes', 'cloud'], "")
 
@@ -569,7 +569,7 @@ spec:
         node(POD_LABEL) {
             stage (branchName) {
                 container(cname) {
-                    runSteps(image, config, branchName, axis)
+                    func(image, config, branchName, axis)
                 }
             }
         }
@@ -733,7 +733,7 @@ Map getTasks(axes, image, config, include, exclude) {
                 if (image.nodeLabel) {
                     runDocker(image, config, branchName, axis, { pimage, pconfig -> runSteps(pimage, pconfig, branchName, axis) })
                 } else {
-                    runK8(image, branchName, config, axis)
+                    runK8(image, branchName, config, axis, runSteps)
                 }
             }
         }
@@ -946,6 +946,13 @@ def loadConfigFile(filepath, logger) {
     return config
 }
 
+
+def onPipelineStop(image, branchName, config, axis=null) {
+
+    run_step(null, config, branchName, config.pipeline_stop, null)
+}
+
+
 def main() {
     node("master") {
 
@@ -1027,7 +1034,12 @@ def main() {
             } finally {
                 if (config.pipeline_stop) {
                     if (config.pipeline_stop.run) {
-                        run_step(null, config, "pipeline stop", config.pipeline_stop, null)
+                        if (config.pipeline_stop.image) {
+                            runK8(config.pipeline_stop.image, branchName, config, config.pipeline_stop, onPipelineStop)
+                        }
+                        else {
+                            run_step(null, config, branchName, config.pipeline_stop, null)
+                        }
                     }
                 }
             }
